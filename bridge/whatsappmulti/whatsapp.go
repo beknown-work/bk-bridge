@@ -10,6 +10,7 @@ import (
 	"mime"
 	"os"
 	"path/filepath"
+	"regexp"
 	"time"
 
 	"github.com/42wim/matterbridge/bridge"
@@ -143,20 +144,20 @@ func (b *Bwhatsapp) Connect() error {
 	}
 
 	// get user avatar asynchronously
-	b.Log.Info("Getting user avatars..")
+	// b.Log.Info("Getting user avatars..")
 
-	for jid := range b.users {
-		info, err := b.GetProfilePicThumb(jid)
-		if err != nil {
-			b.Log.Warnf("Could not get profile photo of %s: %v", jid, err)
-		} else {
-			b.Lock()
-			if info != nil {
-				b.userAvatars[jid] = info.URL
-			}
-			b.Unlock()
-		}
-	}
+	// for jid := range b.users {
+	// 	info, err := b.GetProfilePicThumb(jid)
+	// 	if err != nil {
+	// 		b.Log.Warnf("Could not get profile photo of %s: %v", jid, err)
+	// 	} else {
+	// 		b.Lock()
+	// 		if info != nil {
+	// 			b.userAvatars[jid] = info.URL
+	// 		}
+	// 		b.Unlock()
+	// 	}
+	// }
 
 	b.Log.Info("Finished getting avatars..")
 
@@ -220,6 +221,7 @@ func (b *Bwhatsapp) PostDocumentMessage(msg config.Message, filetype string) (st
 	fi := msg.Extra["file"][0].(config.FileInfo)
 
 	caption := msg.Username + fi.Comment
+	mentionedJids := b.parseMentions(caption) // Parse mentions from caption
 
 	resp, err := b.wc.Upload(context.Background(), *fi.Data, whatsmeow.MediaDocument)
 	if err != nil {
@@ -230,7 +232,15 @@ func (b *Bwhatsapp) PostDocumentMessage(msg config.Message, filetype string) (st
 	var message proto.Message
 	var ctx *proto.ContextInfo
 	if msg.ParentID != "" {
-		ctx, _ = b.getNewReplyContext(msg.ParentID)
+		ctx, _ = b.getNewReplyContext(msg.ParentID) // Error ignored for simplicity, consider handling
+	}
+
+	// Ensure context exists if we have mentions
+	if len(mentionedJids) > 0 {
+		if ctx == nil {
+			ctx = &proto.ContextInfo{}
+		}
+		ctx.MentionedJID = mentionedJids
 	}
 
 	message.DocumentMessage = &proto.DocumentMessage{
@@ -261,6 +271,7 @@ func (b *Bwhatsapp) PostImageMessage(msg config.Message, filetype string) (strin
 	fi := msg.Extra["file"][0].(config.FileInfo)
 
 	caption := msg.Username + fi.Comment
+	mentionedJids := b.parseMentions(caption) // Parse mentions from caption
 
 	resp, err := b.wc.Upload(context.Background(), *fi.Data, whatsmeow.MediaImage)
 	if err != nil {
@@ -270,7 +281,15 @@ func (b *Bwhatsapp) PostImageMessage(msg config.Message, filetype string) (strin
 	var message proto.Message
 	var ctx *proto.ContextInfo
 	if msg.ParentID != "" {
-		ctx, _ = b.getNewReplyContext(msg.ParentID)
+		ctx, _ = b.getNewReplyContext(msg.ParentID) // Error ignored for simplicity, consider handling
+	}
+
+	// Ensure context exists if we have mentions
+	if len(mentionedJids) > 0 {
+		if ctx == nil {
+			ctx = &proto.ContextInfo{}
+		}
+		ctx.MentionedJID = mentionedJids
 	}
 
 	message.ImageMessage = &proto.ImageMessage{
@@ -295,6 +314,7 @@ func (b *Bwhatsapp) PostVideoMessage(msg config.Message, filetype string) (strin
 	fi := msg.Extra["file"][0].(config.FileInfo)
 
 	caption := msg.Username + fi.Comment
+	mentionedJids := b.parseMentions(caption) // Parse mentions from caption
 
 	resp, err := b.wc.Upload(context.Background(), *fi.Data, whatsmeow.MediaVideo)
 	if err != nil {
@@ -304,7 +324,15 @@ func (b *Bwhatsapp) PostVideoMessage(msg config.Message, filetype string) (strin
 	var message proto.Message
 	var ctx *proto.ContextInfo
 	if msg.ParentID != "" {
-		ctx, _ = b.getNewReplyContext(msg.ParentID)
+		ctx, _ = b.getNewReplyContext(msg.ParentID) // Error ignored for simplicity, consider handling
+	}
+
+	// Ensure context exists if we have mentions
+	if len(mentionedJids) > 0 {
+		if ctx == nil {
+			ctx = &proto.ContextInfo{}
+		}
+		ctx.MentionedJID = mentionedJids
 	}
 
 	message.VideoMessage = &proto.VideoMessage{
@@ -330,18 +358,21 @@ func (b *Bwhatsapp) PostAudioMessage(msg config.Message, filetype string) (strin
 
 	fi := msg.Extra["file"][0].(config.FileInfo)
 
+	// Upload audio
 	resp, err := b.wc.Upload(context.Background(), *fi.Data, whatsmeow.MediaAudio)
 	if err != nil {
 		return "", err
 	}
 
-	var message proto.Message
-	var ctx *proto.ContextInfo
+	var audioMessage proto.Message
+	var audioCtx *proto.ContextInfo
 	if msg.ParentID != "" {
-		ctx, _ = b.getNewReplyContext(msg.ParentID)
+		// Apply reply context ONLY to the audio message itself, not the caption.
+		// Mentions will be handled in the separate caption message.
+		audioCtx, _ = b.getNewReplyContext(msg.ParentID) // Error ignored for simplicity, consider handling
 	}
 
-	message.AudioMessage = &proto.AudioMessage{
+	audioMessage.AudioMessage = &proto.AudioMessage{
 		Mimetype:      &filetype,
 		MediaKey:      resp.MediaKey,
 		FileEncSHA256: resp.FileEncSHA256,
@@ -349,21 +380,51 @@ func (b *Bwhatsapp) PostAudioMessage(msg config.Message, filetype string) (strin
 		FileLength:    goproto.Uint64(resp.FileLength),
 		URL:           &resp.URL,
 		DirectPath:    &resp.DirectPath,
-		ContextInfo:   ctx,
+		ContextInfo:   audioCtx, // Use context only for reply here
 	}
 
 	b.Log.Debugf("=> Sending %#v as audio", msg)
 
-	ID, err := b.sendMessage(msg, &message)
+	// Send the audio message
+	audioMsgID, err := b.sendMessage(msg, &audioMessage)
+	if err != nil {
+		b.Log.Errorf("Failed to send audio message part: %v", err)
+		// Decide if we should still try to send the caption or return here
+		// return "", err // Option: return error immediately
+	}
 
-	var captionMessage proto.Message
-	caption := msg.Username + fi.Comment + "\u2B06" // the char on the end is upwards arrow emoji
-	captionMessage.Conversation = &caption
+	// Prepare and send the caption message separately, including mentions
+	caption := msg.Username + fi.Comment
+	if caption != "" { // Only send caption if it's not empty
+		caption += "\n\u2B06" // the char on the end is upwards arrow emoji
+		mentionedJids := b.parseMentions(caption)
 
-	captionID := whatsmeow.GenerateMessageID()
-	_, err = b.wc.SendMessage(context.TODO(), groupJID, &captionMessage, whatsmeow.SendRequestExtra{ID: captionID})
+		var captionMessage proto.Message
+		var captionCtx *proto.ContextInfo // Separate context for the caption message
 
-	return ID, err
+		// If there are mentions, we MUST use ExtendedTextMessage
+		if len(mentionedJids) > 0 {
+			captionCtx = &proto.ContextInfo{MentionedJID: mentionedJids}
+			captionMessage.ExtendedTextMessage = &proto.ExtendedTextMessage{
+				Text:        &caption,
+				ContextInfo: captionCtx,
+			}
+		} else {
+			// No mentions, send as simple conversation
+			captionMessage.Conversation = &caption
+		}
+
+		captionID := whatsmeow.GenerateMessageID() // Generate a new ID for the caption
+		_, captionErr := b.wc.SendMessage(context.TODO(), groupJID, &captionMessage, whatsmeow.SendRequestExtra{ID: captionID})
+		if captionErr != nil {
+			b.Log.Errorf("Failed to send caption for audio message: %v", captionErr)
+			// Return the original audio message ID but log the caption error
+			// Or potentially return the caption error if it's more critical
+		}
+	}
+
+	// Return the ID of the main audio message
+	return audioMsgID, err // Return the result of sending the audio part
 }
 
 // Send a message from the bridge to WhatsApp
@@ -423,25 +484,44 @@ func (b *Bwhatsapp) Send(msg config.Message) (string, error) {
 	}
 
 	var message proto.Message
-	text := msg.Username + msg.Text
+	text := msg.Text + msg.Username
+	mentionedJids := b.parseMentions(text) // Parse mentions from text
 
-	// If we have a parent ID send an extended message
-	if msg.ParentID != "" {
-		replyContext, err := b.getNewReplyContext(msg.ParentID)
+	// Use ExtendedTextMessage if it's a reply OR if there are mentions
+	isReply := msg.ParentID != ""
+	hasMentions := len(mentionedJids) > 0
 
-		if err == nil {
-			message = proto.Message{
-				ExtendedTextMessage: &proto.ExtendedTextMessage{
-					Text:        &text,
-					ContextInfo: replyContext,
-				},
+	if isReply || hasMentions {
+		var ctx *proto.ContextInfo
+		var err error
+		if isReply {
+			ctx, err = b.getNewReplyContext(msg.ParentID)
+			if err != nil {
+				b.Log.Warnf("Failed to get reply context for ParentID %s: %v. Sending without reply context.", msg.ParentID, err)
+				// Fallback: create a new context or proceed without reply context
+				ctx = &proto.ContextInfo{} // Create empty context if reply fails but mentions exist
 			}
-
-			return b.sendMessage(msg, &message)
 		}
-	}
+		// Ensure context exists if needed (either from reply or for mentions)
+		if ctx == nil {
+			ctx = &proto.ContextInfo{}
+		}
 
-	message.Conversation = &text
+		// Add mentions if they exist
+		if hasMentions {
+			ctx.MentionedJID = mentionedJids
+		}
+
+		message = proto.Message{
+			ExtendedTextMessage: &proto.ExtendedTextMessage{
+				Text:        &text,
+				ContextInfo: ctx,
+			},
+		}
+	} else {
+		// No reply and no mentions, send as simple conversation
+		message.Conversation = &text
+	}
 
 	return b.sendMessage(msg, &message)
 }
@@ -453,4 +533,37 @@ func (b *Bwhatsapp) sendMessage(rmsg config.Message, message *proto.Message) (st
 	_, err := b.wc.SendMessage(context.Background(), groupJID, message, whatsmeow.SendRequestExtra{ID: ID})
 
 	return getMessageIdFormat(*b.wc.Store.ID, ID), err
+}
+
+// parseMentions finds mentions in the format @<number> and returns a list of corresponding JIDs.
+func (b *Bwhatsapp) parseMentions(text string) []string {
+	// Regular expression to find @ followed by digits
+	re := regexp.MustCompile(`@(\d+)`)
+	matches := re.FindAllStringSubmatch(text, -1)
+
+	var mentionedJids []string
+	if len(matches) > 0 {
+		jidsMap := make(map[string]struct{}) // Use a map to store unique JIDs
+		for _, match := range matches {
+			if len(match) > 1 {
+				// Construct JID: number@s.whatsapp.net
+				jid := match[1] + "@s.whatsapp.net"
+				// Validate the constructed JID (optional but recommended)
+				if _, err := types.ParseJID(jid); err == nil {
+					if _, exists := jidsMap[jid]; !exists {
+						jidsMap[jid] = struct{}{}
+						mentionedJids = append(mentionedJids, jid)
+					}
+				} else {
+					b.Log.Warnf("Invalid JID format created from mention %s: %v", match[0], err)
+				}
+			}
+		}
+	}
+
+	if len(mentionedJids) > 0 {
+		b.Log.Debugf("Found mentions, JIDs: %v", mentionedJids)
+		return mentionedJids
+	}
+	return nil
 }

@@ -118,7 +118,7 @@ func (b *Bmattermost) sendWebhook(msg config.Message) (string, error) {
 	}
 
 	if b.GetBool("PrefixMessagesWithNick") {
-		msg.Text = msg.Username + msg.Text
+		msg.Text = msg.Text + msg.Username
 	}
 
 	if msg.Extra != nil {
